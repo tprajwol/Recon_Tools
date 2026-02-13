@@ -1,0 +1,49 @@
+#!/bin/bash
+
+# Check if input file is provided
+if [ -z "$1" ]; then
+  echo "Usage: ./resolve.sh subdomains.txt"
+  exit 1
+fi
+
+INPUT_FILE=$1
+OUTPUT_FILE="live_subdomains.txt"
+
+# Clear previous output file if it exists
+> "$OUTPUT_FILE"
+
+# Print header
+printf "%-35s | %-12s | %-15s | %-6s\n" "SUBDOMAIN" "DNS STATUS" "IP ADDRESS" "HTTP"
+echo "---------------------------------------------------------------------------------------"
+
+while IFS= read -r sub || [[ -n "$sub" ]]; do
+    # Clean input
+    sub=$(echo "$sub" | tr -d '\r' | xargs)
+    [[ -z "$sub" ]] && continue
+
+    # Perform standard A-record lookup
+    dig_output=$(dig +nocmd "$sub" A +noall +comments +answer)
+    
+    # Parse DNS Status and IP
+    dns_status=$(echo "$dig_output" | grep -i "status:" | awk -F'status: ' '{print $2}' | awk -F',' '{print $1}')
+    ip_address=$(echo "$dig_output" | awk '/IN[[:space:]]+A/ {print $5}' | head -n 1)
+    
+    # Fallbacks
+    [[ -z "$dns_status" ]] && dns_status="TIMEOUT"
+    [[ -z "$ip_address" ]] && ip_address="N/A"
+
+    # Save only NOERROR domains to the file
+    if [ "$dns_status" == "NOERROR" ]; then
+        echo "$sub" >> "$OUTPUT_FILE"
+    fi
+
+    # Get HTTP status code
+    http_code=$(curl -o /dev/null -s -w "%{http_code}" --max-time 2 "http://$sub")
+
+    # Output to terminal
+    printf "%-35s | %-12s | %-15s | %-6s\n" "$sub" "$dns_status" "$ip_address" "$http_code"
+
+done < "$INPUT_FILE"
+
+echo "---------------------------------------------------------------------------------------"
+echo "Done! Live subdomains have been saved to: $OUTPUT_FILE"
