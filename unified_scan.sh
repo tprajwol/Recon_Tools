@@ -27,6 +27,7 @@ LIVE_HOSTS_FILE=""
 DNS_HTTP_REPORT_FILE=""
 SUMMARY_FILE=""
 AUTO_RESOLVERS_FILE=""
+FINAL_RESULTS_FILE=""
 
 APT_UPDATED=0
 
@@ -162,8 +163,16 @@ ensure_prerequisite() {
     pip3)
       apt_install python3-pip
       ;;
+    pipx)
+      # pipx avoids PEP-668 / "externally-managed" issues by using venvs
+      apt_install pipx python3-venv
+      ;;
     cargo)
-      apt_install cargo
+      # Rust toolchain + common native deps for crates with TLS
+      apt_install cargo rustc build-essential pkg-config libssl-dev
+      ;;
+    git)
+      apt_install git
       ;;
     curl)
       apt_install curl
@@ -205,6 +214,9 @@ run_install_command() {
     go\ install*)
       ensure_prerequisite go || return 1
       ;;
+    pipx\ install*)
+      ensure_prerequisite pipx || return 1
+      ;;
     pip3\ install*|python3\ -m\ pip*)
       ensure_prerequisite pip3 || return 1
       ;;
@@ -225,6 +237,39 @@ run_install_command() {
     if ! run_as_root "$install_cmd" >>"$install_log" 2>&1; then
       warn "Install failed for $tool (see $install_log)"
       return 1
+    fi
+  elif [[ "$install_cmd" == pipx\ install* ]]; then
+    # pipx sometimes needs git when installing from git+https URLs
+    if [[ "$install_cmd" == *git+https://* ]]; then
+      ensure_prerequisite git || true
+    fi
+    if ! bash -lc "$install_cmd" >>"$install_log" 2>&1; then
+      # Fallback for environments without pipx or where pipx fails unexpectedly
+      # (still try user-level pip and allow Debian/Ubuntu externally-managed override).
+      local spec
+      spec=""
+      # Extract first non-flag argument after: pipx install ...
+      # Example: "pipx install --force cloud-enum" => "cloud-enum"
+      # Example: "pipx install --force git+https://..." => "git+https://..."
+      read -r -a __pipx_parts <<<"$install_cmd"
+      for ((i=2; i<${#__pipx_parts[@]}; i++)); do
+        if [[ "${__pipx_parts[i]}" == -* ]]; then
+          continue
+        fi
+        spec="${__pipx_parts[i]}"
+        break
+      done
+      unset __pipx_parts
+      if [[ -z "$spec" ]]; then
+        warn "pipx install failed for $tool and fallback spec parsing failed (see $install_log)"
+        return 1
+      fi
+      warn "pipx install failed for $tool; trying pip --user fallback (see $install_log)"
+      ensure_prerequisite pip3 || true
+      if ! bash -lc "python3 -m pip install --user --upgrade --break-system-packages $spec" >>"$install_log" 2>&1; then
+        warn "Install failed for $tool (see $install_log)"
+        return 1
+      fi
     fi
   else
     if ! bash -lc "$install_cmd" >>"$install_log" 2>&1; then
@@ -599,23 +644,24 @@ init_mappings() {
 
   INSTALL_COMMANDS["x8"]="cargo install x8"
   INSTALL_COMMANDS["httpx"]="go install github.com/projectdiscovery/httpx/cmd/httpx@latest"
-  INSTALL_COMMANDS["cloud_enum"]="pip3 install --upgrade cloud-enum"
+  INSTALL_COMMANDS["cloud_enum"]="pipx install --force cloud-enum"
   INSTALL_COMMANDS["ffuf"]="go install github.com/ffuf/ffuf/v2@latest"
-  INSTALL_COMMANDS["parameth"]="pip3 install --upgrade parameth"
+  INSTALL_COMMANDS["parameth"]="pipx install --force parameth"
   INSTALL_COMMANDS["waybackurls"]="go install github.com/tomnomnom/waybackurls@latest"
-  INSTALL_COMMANDS["linkfinder"]="pip3 install --upgrade linkfinder"
+  # LinkFinder packaging varies; pipx is safer than system pip.
+  INSTALL_COMMANDS["linkfinder"]="pipx install --force linkfinder"
   INSTALL_COMMANDS["nuclei"]="go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
   INSTALL_COMMANDS["gospider"]="go install github.com/jaeles-project/gospider@latest"
   INSTALL_COMMANDS["metabigor"]="go install github.com/j3ssie/metabigor@latest"
-  INSTALL_COMMANDS["sublist3r"]="pip3 install --upgrade sublist3r"
-  INSTALL_COMMANDS["arjun"]="pip3 install --upgrade arjun"
+  INSTALL_COMMANDS["sublist3r"]="pipx install --force sublist3r"
+  INSTALL_COMMANDS["arjun"]="pipx install --force arjun"
   INSTALL_COMMANDS["cewl"]="apt-get install -y cewl"
   INSTALL_COMMANDS["subfinder"]="go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
   INSTALL_COMMANDS["dnsx"]="go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest"
   INSTALL_COMMANDS["assetfinder"]="go install github.com/tomnomnom/assetfinder@latest"
-  INSTALL_COMMANDS["github-recon"]="python3 -m pip install --upgrade git+https://github.com/gwen001/github-recon.git"
+  INSTALL_COMMANDS["github-recon"]="pipx install --force git+https://github.com/gwen001/github-recon.git"
   INSTALL_COMMANDS["katana"]="go install github.com/projectdiscovery/katana/cmd/katana@latest"
-  INSTALL_COMMANDS["subdomainizer"]="pip3 install --upgrade subdomainizer"
+  INSTALL_COMMANDS["subdomainizer"]="pipx install --force subdomainizer"
   INSTALL_COMMANDS["shuffledns"]="go install github.com/projectdiscovery/shuffledns/cmd/shuffledns@latest"
 }
 
@@ -716,6 +762,7 @@ prepare_output_paths() {
   LIVE_HOSTS_FILE="$SUBDOMAIN_DIR/live_hosts.txt"
   DNS_HTTP_REPORT_FILE="$OUT_DIR/dns_http_report.txt"
   SUMMARY_FILE="$OUT_DIR/summary.txt"
+  FINAL_RESULTS_FILE="$OUT_DIR/final_results.txt"
   AUTO_RESOLVERS_FILE="$OUT_DIR/resolvers_auto.txt"
 
   mkdir -p "$OUT_DIR" "$TOOLS_DIR" "$LOG_DIR" "$SUBDOMAIN_DIR"
@@ -775,6 +822,50 @@ scan_post_tools() {
   done
 }
 
+write_final_results() {
+  local tool out_file log_file status lines bytes
+
+  {
+    echo "Unified Scan - Final Results"
+    echo "============================"
+    echo "Target input : $TARGET_INPUT"
+    echo "Target domain: $TARGET_DOMAIN"
+    echo "Target URL   : $TARGET_URL"
+    echo "Output dir   : $OUT_DIR"
+    echo
+    echo "Key artifacts:"
+    echo "  - All subdomains : $ALL_SUBDOMAINS_FILE"
+    echo "  - Live subdomains: $LIVE_SUBDOMAINS_FILE"
+    echo "  - Live hosts     : $LIVE_HOSTS_FILE"
+    echo "  - DNS/HTTP report: $DNS_HTTP_REPORT_FILE"
+    echo
+    echo "Counts:"
+    echo "  - all_subdomains : $(wc -l <"$ALL_SUBDOMAINS_FILE" 2>/dev/null || echo 0)"
+    echo "  - live_subdomains: $(wc -l <"$LIVE_SUBDOMAINS_FILE" 2>/dev/null || echo 0)"
+    echo "  - live_hosts     : $(wc -l <"$LIVE_HOSTS_FILE" 2>/dev/null || echo 0)"
+    echo
+    echo "Per-tool results (status + output/log paths):"
+    for tool in "${ALL_TOOLS[@]}"; do
+      out_file="$TOOLS_DIR/${tool}.txt"
+      log_file="$LOG_DIR/${tool}.log"
+      status="${TOOL_STATUS[$tool]:-unknown}"
+      lines="0"
+      bytes="0"
+      if [[ -f "$out_file" ]]; then
+        lines="$(wc -l <"$out_file" 2>/dev/null || echo 0)"
+        bytes="$(wc -c <"$out_file" 2>/dev/null || echo 0)"
+      fi
+      printf "  - %-13s : %-8s | %s lines | %s bytes | out=%s | log=%s\n" \
+        "$tool" "$status" "$lines" "$bytes" "$out_file" "$log_file"
+
+      # If install failed, point to install log explicitly
+      if [[ "$status" == "missing" && -f "$LOG_DIR/install_${tool}.log" ]]; then
+        printf "                 install_log=%s\n" "$LOG_DIR/install_${tool}.log"
+      fi
+    done
+  } >"$FINAL_RESULTS_FILE"
+}
+
 main() {
   local tool
 
@@ -817,9 +908,11 @@ main() {
   scan_post_tools
 
   write_summary
+  write_final_results
 
   log "Scan complete."
   log "Summary: $SUMMARY_FILE"
+  log "Final results: $FINAL_RESULTS_FILE"
 }
 
 main "$@"

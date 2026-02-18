@@ -30,6 +30,7 @@ Each run creates a timestamped directory under `scan_results/` with:
 - merged subdomains and live hosts (`subdomains/`)
 - DNS + HTTP/HTTPS status report (`dns_http_report.txt`)
 - execution summary (`summary.txt`)
+- final summarized results (`final_results.txt`)
 
  # DNS_resolve
    This script is a custom DNS and Web reconnaissance tool designed to validate passive subdomain lists for security analysis. It filters raw subdomain data by performing active DNS lookups     and HTTP requests to determine which targets are truly "live."
